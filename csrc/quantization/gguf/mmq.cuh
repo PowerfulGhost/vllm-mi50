@@ -33,6 +33,10 @@
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __device__ __forceinline__ void mul_mat_q(
+
+// =================================
+// 变量声明，smem分配
+
     const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
@@ -69,6 +73,9 @@ static __device__ __forceinline__ void mul_mat_q(
 
     // 分配寄存器sum，大小 mmq_y/WARP_SIZE_GGUF * mmqx/nwarps = 4*8 作用暂时未知
     float sum[mmq_y/WARP_SIZE_GGUF][mmq_x/nwarps] = {{0.0f}};
+
+// =================================================
+// 计算
 
     for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) { // warp stride? ib是block的索引？
 
@@ -114,6 +121,7 @@ static __device__ __forceinline__ void mul_mat_q(
 
             __syncthreads();
 
+            // vec dot
 // #pragma unroll // unrolling this loop causes too much register pressure
             for (int k = ir*WARP_SIZE_GGUF/qr; k < (ir+1)*WARP_SIZE_GGUF/qr; k += vdr) {
 #pragma unroll
@@ -130,6 +138,8 @@ static __device__ __forceinline__ void mul_mat_q(
         }
     }
 
+// ======================================================
+// 写回内存
 #pragma unroll
     for (int j = 0; j < mmq_x; j += nwarps) {
         const auto col_dst = col_dst_0 + j + threadIdx.y;
