@@ -1,4 +1,17 @@
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
+
+// void mul_mat_vec_q<c10::Half, 32, 8, block_q8_0, 2, &vec_dot_q8_0_q8_1(void const*, block_q8_1 const*, int const&)>(void const*, void const*, c10::Half*, int, int)
+// ( kernel(void mul_mat_vec_q<c10::Half, 32, 8, block_q8_0, 2, &vec_dot_q8_0_q8_1(void const*, block_q8_1 const*, int const&)>(void const*, void const*, c10::Half*, int, int)) function_address(0x7d5fb11812b0) numBlocks({z(1) y(1) x(896}) dimBlocks({z(1) y(1) x(64}) args(0x7ffd697027a8) sharedMemBytes(0) stream(1))
+
+// scalar_t: c10::Half
+// qk: 32
+// qi: 8
+// block_q_t: block_q8_0
+// vdr: 2
+// vec_dot_q_cuda: vec_dot_q8_0_q8_1
+// grid: 1,1,896
+// block: 1,1,64
+
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows) {
     const auto row = blockIdx.x*blockDim.y + threadIdx.y;

@@ -874,6 +874,18 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q8_0(
     *x_dm = (half2 *) tile_x_d;
 }
 
+
+// load_tiles(x + row_x_0*blocks_per_row_x + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, threadIdx.y, nrows_x-row_x_0-1, threadIdx.x, blocks_per_row_x);
+
+// vx: x + row_x_0*blocks_per_row_x + ib0
+// x_ql: tile_x_ql
+// x_dm: tile_x_dm
+// x_qh: tile_x_qh
+// x_sc: tile_x_sc
+// i_offset: threadIdx.y
+// i_max:  nrows_x-row_x_0-1
+// k: threadIdx.x
+// blocks_pre_row: blocks_per_row_x
 template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
     int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
@@ -884,7 +896,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     const block_q8_0 * bx0 = (const block_q8_0 *) vx;
 
 #pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) { // warp stride?
         int i = i0 + i_offset;
 
         if (need_check) {

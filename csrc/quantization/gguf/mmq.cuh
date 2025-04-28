@@ -1,4 +1,35 @@
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+
+
+// mul_mat_q<scalar_t, QK8_0, QR8_0, QI8_0, false, block_q8_0, mmq_x, mmq_y, nwarps, allocate_tiles_q8_0<mmq_y>, load_tiles_q8_0<mmq_y, nwarps need_check>, VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat> (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+
+// Data Structures
+// QK = number of values after dequantization
+// QR = QK / number of values before dequantization
+// QI = number of 32 bit integers before dequantization
+
+// scalar_t: c10::Half
+// qk: QK8_0 = 32
+// qr: QR8_0 = 1
+// qi: QI8_0 = 32 / 4 = 8
+// need_sum: false
+// block_q_t: block_q8_0
+// mmq_x: MMQ_X_Q8_0 = 64
+// mmq_y: MMQ_Y_Q8_0 = 128
+// nwarps: NWARPS_Q8_0 = 8
+// allocate_tiles: allocate_tiles_q8_0<mmq_y>
+// load_tiles: load_tiles_q8_0<mmq_y, nwarps, need_check>
+// vdr: VDR_Q8_0_Q8_1_MMQ
+// vec_dot: vec_dot_q8_0_q8_1_mul_mat
+
+// const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+// const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+// const dim3 block_nums(block_num_x, block_num_y, 1);
+// const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+// grid: nrows_x/mmq_y, ncols_y/mmq_x
+// block: WARP_SIZE_GGUF, nwarps
+
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __device__ __forceinline__ void mul_mat_q(
@@ -8,16 +39,16 @@ static __device__ __forceinline__ void mul_mat_q(
     const block_q_t  * x = (const block_q_t  *) vx;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    const int blocks_per_row_x = ncols_x / qk;
-    const int blocks_per_col_y = nrows_y / QK8_1;
-    const int blocks_per_warp = WARP_SIZE_GGUF / qi;
+    const int blocks_per_row_x = ncols_x / qk; // x每行的 gguf block 数量，行的长度除以分block的粒度，可能暗示nclos_x != vx.shape[1]
+    const int blocks_per_col_y = nrows_y / QK8_1; // y每列的 gguf block数量，列的长度除以分block的粒度，可能暗示nrows_y != vy.shape[0]
+    const int blocks_per_warp = WARP_SIZE_GGUF / qi; // 每个warp要处理的 gguf block，32/8 = 4，为什么要除以qi？
 
-    const int & ncols_dst = ncols_y;
+    const int & ncols_dst = ncols_y; // 输出的列数
 
-    const auto row_dst_0 = blockIdx.x*mmq_y;
+    const auto row_dst_0 = blockIdx.x*mmq_y; // 输出的行的起始索引？ = blockIdx.x * 128，暗示一个block处理mmq_y行数据？
     const int & row_x_0 = row_dst_0;
 
-    const auto col_dst_0 = blockIdx.y*mmq_x;
+    const auto col_dst_0 = blockIdx.y*mmq_x; // 输出的列的起始索引？ = blockIdx.y * 64，暗示一个block处理mmq_x列数据？
     const int & col_y_0 = col_dst_0;
 
     int   * tile_x_ql = nullptr;
@@ -25,15 +56,29 @@ static __device__ __forceinline__ void mul_mat_q(
     int   * tile_x_qh = nullptr;
     int   * tile_x_sc = nullptr;
 
-    allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
+    // 分配smem，x_ql存储量化权重（mmq_y*WARP_SIZE_GGUF+mmq_y），x_dm存储缩放因子（mmq_y*WARP_SIZE_GGUF/QI8_0 + mmqy/QI8_0），后面的加项可能是为了避免bank conflict
+    // 实际可用smem：
+    // x_ql: mmq_y * WARP_SIZE_GGUF = 128 * 32 （int32）
+    // x_dm: mmq_y * WARP_SIZE_GGUF / 8 = 128 * 8
+    // 8个量化权重对应一个缩放因子？不对，x_ql是int32，实际上还是32个量化权重对应一个缩放因子
+    allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc); 
 
-    __shared__ int    tile_y_qs[mmq_x * WARP_SIZE_GGUF];
-    __shared__ half2  tile_y_ds[mmq_x * WARP_SIZE_GGUF/QI8_1];
+    // 分配y的smem，y是运行时量化的输入，Q8_1量化
+    __shared__ int    tile_y_qs[mmq_x * WARP_SIZE_GGUF]; // 64 * 32 （int32）
+    __shared__ half2  tile_y_ds[mmq_x * WARP_SIZE_GGUF/QI8_1]; // half2包括ds和sum，ds.x = delta, ds.y = sum，大小 64 * 8
 
+    // 分配寄存器sum，大小 mmq_y/WARP_SIZE_GGUF * mmqx/nwarps = 4*8 作用暂时未知
     float sum[mmq_y/WARP_SIZE_GGUF][mmq_x/nwarps] = {{0.0f}};
 
-    for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
+    for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) { // warp stride? ib是block的索引？
 
+        // 从dram中加载权重
+        // dram起始地址 = x + row_x_0*blocks_per_row_x + ib0，
+        // tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc：指向smem的指针
+        // threadIdx.y: i_offset，
+        // nrows_x-row_x_0-1: i_max
+        // threadIdx.x: k
+        // blocks_per_row_x: blocks_pre_row
         load_tiles(x + row_x_0*blocks_per_row_x + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
                    threadIdx.y, nrows_x-row_x_0-1, threadIdx.x, blocks_per_row_x);
 
