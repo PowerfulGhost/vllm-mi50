@@ -301,22 +301,22 @@ torch::Tensor ggml_mul_mat_a8_q8_0_mi50(torch::Tensor W,  // quant weight, q8_0
       (half*)X.data_ptr(), (block_q8_0*)quant_X.data_ptr(), nrows_x, ncols,
       ncols_x_padded, block_q8_0_per_row);
 
-  // do matmul
+  // matmul
   int& nrows_out = nrows_x;
   int& ncols_out = nrows_w;
   options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({nrows_out, ncols_out}, options);
 
   int num_qblocks_per_row = (ncols + QK8_0 - 1) / QK8_0;
-  int num_segment_per_row =
-      (num_qblocks_per_row + QBLOCKS_PER_SEGMENT - 1) / QBLOCKS_PER_SEGMENT;
+  int num_segment_per_row = (num_qblocks_per_row + QBLOCKS_PER_SEGMENT - 1) / QBLOCKS_PER_SEGMENT;
 
   int num_invald_qblocks_per_row;
   if (num_qblocks_per_row % QBLOCKS_PER_SEGMENT == 0)
     num_invald_qblocks_per_row = 0;
   else
-    num_invald_qblocks_per_row =
-        QBLOCKS_PER_SEGMENT - (num_qblocks_per_row % QBLOCKS_PER_SEGMENT);
+    num_invald_qblocks_per_row = QBLOCKS_PER_SEGMENT - (num_qblocks_per_row % QBLOCKS_PER_SEGMENT);
+  printf("num_qblocks_per_row: %d\n", num_qblocks_per_row);
+  printf("num_invald_qblocks_per_row: %d\n",num_invald_qblocks_per_row);
 
   int num_tiles_col = (ncols_out + TILE_SIZE_COL - 1) / TILE_SIZE_COL;
   int num_tiles_row = (nrows_out + TILE_SIZE_ROW - 1) / TILE_SIZE_ROW;
