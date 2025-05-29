@@ -1,3 +1,5 @@
+#pragma once
+
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
 #define QK_K 256
 #define K_QUANTS_PER_ITERATION 2

@@ -1,30 +1,52 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include "quantize_q8_0_mi50.cuh"
+
+#include "debug_utils.cuh"
 
 #define WARP_SIZE_GCN 64
 
-// matmul tile size def
-#define TILE_SIZE_COL 64 // unit: (unquantized) element
-#define TILE_SIZE_ROW 32 //  unit: (unquantized) element
+// block size
+#define BLOCK_SIZE_SEGMENT 8 // blockIdx.x direction
+#define BLOCK_SIZE_COL 16     // blockIdx.y direction
+#define BLOCK_SIZE_ROW 4     // blockIdx.z direction
 
-// how many quantize blocks (block_q8_0 and block_q8_1) in each segment
-// for each tile, input data is loaded and calculated segment by segment
-// since shared memory is limited.
-// NOTE: actually we need to load double number of qblocks, half of them from
-// qweight and half of them from x.
-// NOTE : we set this to warp size of gcn arch (64) so it's convenience to use
-// warp shuffle to reduce partial sum of qblocks in a segment
-#define QBLOCKS_PER_SEGMENT 8
+// matmul tile size def
+#define TILE_SIZE_COL 16 // unit: (unquantized) element
+#define TILE_SIZE_ROW 16 //  unit: (unquantized) element
 
 __device__ __forceinline__ void allocate_shared_memory(int32_t *&qweight_qs, half *&qweight_d,
                                                        int32_t *&x_qs, half *&x_d)
 {
-    // TILE_SIZE_COL divede by 2 because we calculate half part of the output and then calculate the other half part, so we only need to cache half of the qweights
-    __shared__ int32_t _qweight_qs[TILE_SIZE_COL * QBLOCKS_PER_SEGMENT * QI8_0];
-    __shared__ int32_t _x_qs[TILE_SIZE_ROW * QBLOCKS_PER_SEGMENT * QI8_0];
-    __shared__ half _qweight_d[TILE_SIZE_COL * QBLOCKS_PER_SEGMENT];
-    __shared__ half _x_d[TILE_SIZE_ROW * QBLOCKS_PER_SEGMENT];
+    __shared__ int32_t _qweight_qs[TILE_SIZE_COL * BLOCK_SIZE_SEGMENT * QI8_0];
+    __shared__ int32_t _x_qs[TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT * QI8_0];
+    __shared__ half _qweight_d[TILE_SIZE_COL * BLOCK_SIZE_SEGMENT];
+    __shared__ half _x_d[TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT];
+
+    // if (is_first_block() && is_first_thread())
+    // {
+    //     for (auto i = 0; i < TILE_SIZE_COL * BLOCK_SIZE_SEGMENT * QI8_0; i++)
+    //     {
+    //         _qweight_qs[i] = 0;
+    //     }
+    //     printf("qweght_qs inited\n");
+    //     for (auto i = 0; i < TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT * QI8_0; i++)
+    //     {
+    //         _x_qs[i] = 0;
+    //     }
+    //     printf("x_qs inited\n");
+    //     for (auto i = 0; i < TILE_SIZE_COL * BLOCK_SIZE_SEGMENT; i++)
+    //     {
+    //         _qweight_d[i] = __float2half(0.0f);
+    //     }
+    //     printf("qweght_d inited\n");
+    //     for (auto i = 0; i < TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT; i++)
+    //     {
+    //         _x_d[i] = __float2half(0.0f);
+    //     }
+    //     printf("x_d inited\n");
+    // }
 
     qweight_qs = _qweight_qs;
     qweight_d = _qweight_d;
@@ -32,61 +54,52 @@ __device__ __forceinline__ void allocate_shared_memory(int32_t *&qweight_qs, hal
     x_d = _x_d;
 }
 
-__device__ __forceinline__ void print_smem_qs(int32_t *qs, int row, int col)
+// #define MAX_SMEM_QS_ADDR_BIAS (TILE_SIZE_COL * BLOCK_SIZE_SEGMENT * QI8_0 - 1)
+// #define MAX_SMEM_D_ADDR_BIAS (TILE_SIZE_COL * BLOCK_SIZE_SEGMENT - 1)
+__device__ __forceinline__ void load_qblock_to_shared_memory(block_q8_0 *qblock_start, int32_t *smem_qs_start, half *smem_d_start,
+                                                             int global_col_or_row_idx, int tile_col_or_row_idx, int num_qblocks_per_row, int segment_idx, int segment_idx_in_smem,
+                                                             int row_stride, int col_stride, bool loading_qweight)
 {
+    block_q8_0 *qblock = qblock_start + global_col_or_row_idx * num_qblocks_per_row + segment_idx;
 
-    for (int r = 0; r < row; r++)
-    {
-        for (int c = 0; c < col; c++)
-        {
-            printf("%d, ", qs[r * col + c]);
-        }
-        printf("\n");
-    }
-}
+    int _bias = tile_col_or_row_idx * BLOCK_SIZE_SEGMENT + segment_idx_in_smem;
+    int32_t *qs = smem_qs_start + _bias * QI8_0;
+    half *d = smem_d_start + _bias;
 
-__device__ __forceinline__ void print_smem_d(half *d, int row, int col)
-{
-
-    for (int r = 0; r < row; r++)
-    {
-        for (int c = 0; c < col; c++)
-        {
-            printf("%f, ", __half2float(d[r * col + c]));
-        }
-        printf("\n");
-    }
-}
-
-__device__ __forceinline__ void print_qblock(block_q8_0 *b)
-{
-    printf("qs: ");
-    for (int i = 0; i < 32; i++)
-        printf("%d, ", b->qs[i]);
-    printf("\nd: %f\n", __half2float(b->d));
-}
-
-__device__ __forceinline__ void load_qblock_to_shared_memory(block_q8_0 *qblock_start, int32_t *qs_start, half *d_start,
-                                                             int &global_col_or_row_idx, int &tile_col_or_row_idx, int &num_qblocks_per_row, int &segment_idx, int &qblock_idx_in_segment)
-{
-    block_q8_0 *qblock = qblock_start +
-                         (global_col_or_row_idx * num_qblocks_per_row +
-                          segment_idx * QBLOCKS_PER_SEGMENT +
-                          qblock_idx_in_segment);
-
-    int32_t *qs = qs_start + (tile_col_or_row_idx * QBLOCKS_PER_SEGMENT + qblock_idx_in_segment) * QI8_0;
-
-    half *d = d_start + (tile_col_or_row_idx * QBLOCKS_PER_SEGMENT + qblock_idx_in_segment);
+    // if (loading_qweight)
+    //     printf("t%d,%d,%d, row_stride:%d, col_stride:%d, w | qblock_addr_bias:%d, smem_qs_bias:%d(max:%d), smem_d_bias:%d(max:%d)\n", threadIdx.x, threadIdx.y, threadIdx.z, row_stride, col_stride, qblock_addr_bias, smem_qs_bias, MAX_SMEM_QS_ADDR_BIAS, smem_d_bias, MAX_SMEM_D_ADDR_BIAS);
+    // else
+    //     printf("t%d,%d,%d, row_stride:%d, col_stride:%d, x | qblock_addr_bias:%d, smem_qs_bias:%d(max:%d), smem_d_bias:%d(max:%d)\n", threadIdx.x, threadIdx.y, threadIdx.z, row_stride, col_stride, qblock_addr_bias, smem_qs_bias, MAX_SMEM_QS_ADDR_BIAS, smem_d_bias, MAX_SMEM_D_ADDR_BIAS);
 
     memcpy(qs, qblock->qs, QI8_0 * sizeof(int32_t));
     *d = qblock->d;
 }
 
+// __device__ __forceinline__ void load_qblock_to_shared_memory_dbg(block_q8_0 *qblock_start, int32_t *smem_qs_start, half *smem_d_start,
+//                                                                  int global_col_or_row_idx, int tile_col_or_row_idx, int num_qblocks_per_row, int segment_idx, int segment_idx_in_smem)
+// {
+//     block_q8_0 *qblock = qblock_start + global_col_or_row_idx * num_qblocks_per_row + segment_idx;
+
+//     if (is_first_block() && is_first_thread())
+//     {
+//         print_qblock(qblock, 1);
+//     }
+
+//     // printf("b%d,%d,%d,t%d,%d,%d, qblock_start:%p, qblock:%p, global_col_or_row_idx:%d, segment_idx:%d\n", blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z, (void *)qblock_start, (void *)qblock, global_col_or_row_idx, segment_idx);
+
+//     int32_t *qs = smem_qs_start + (tile_col_or_row_idx * BLOCK_SIZE_SEGMENT + segment_idx_in_smem) * QI8_0;
+
+//     half *d = smem_d_start + tile_col_or_row_idx * BLOCK_SIZE_SEGMENT + segment_idx_in_smem;
+
+//     memcpy(qs, qblock->qs, QI8_0 * sizeof(int32_t));
+//     *d = qblock->d;
+// }
+
 __device__ __forceinline__ void get_qblock_from_shared_memory(int32_t *qs_start, half *d_start, block_q8_0 *out,
-                                                              int &tile_col_or_row_idx, int &qblock_idx_in_segment)
+                                                              int tile_col_or_row_idx, int segment_idx_in_smem)
 {
-    int32_t *qs = qs_start + (tile_col_or_row_idx * QBLOCKS_PER_SEGMENT + qblock_idx_in_segment) * QI8_0;
-    half *d = d_start + (tile_col_or_row_idx * QBLOCKS_PER_SEGMENT + qblock_idx_in_segment);
+    int32_t *qs = qs_start + (tile_col_or_row_idx * BLOCK_SIZE_SEGMENT + segment_idx_in_smem) * QI8_0;
+    half *d = d_start + tile_col_or_row_idx * BLOCK_SIZE_SEGMENT + segment_idx_in_smem;
 
     memcpy(out->qs, qs, QI8_0 * sizeof(int32_t));
     out->d = *d;
@@ -129,147 +142,214 @@ __global__ void mul_mat_q8_0_mi50(block_q8_0 *__restrict__ qweight,
                                   block_q8_0 *__restrict__ qx,
                                   half *__restrict__ out, int ncols,
                                   int nrows_weight, int nrows_x,
-                                  int num_qblocks_per_row,
-                                  int num_segments_per_row,
-                                  int num_invalid_qblocks_per_row)
+                                  int num_qblocks_per_row)
 {
-    /*
-    Arguments:
-      qweight: quantized weight, q8_0.
-      qx: quantiezd input, q8_0.
-      out: output, half.
-      ncols: num of columns of weight(unquantized) and x(unquantized), assuming
-        they are equal.
-      nrows_weight: num of rows of weight(unquantized).
-      nrows_x: num of rows of x(unquantized).
-      num_qblocks_per_row: num of block_q8_0 per row, equal to ceil(ncols/QK8_0).
-      num_segments_per_row: num of segments per row,
-        equal to num_qblocks_per_row/QBLOCKS_PER_SEGMENT.
-        rows in qweight and x are loaded and computed segment by segment.
-      num_invalid_qblocks_per_row: num of block_q8_0 that need to be padded at
-        end of each row in qweight and x, to make last segment complete.
-        Actually we don't pad the row but simply do no computation and pretend
-        the dot product of invalid blocks as 0.
 
+    // if (is_first_block() && is_first_thread())
+    // {
+    //     printf("HBM: qweight:\n");
+    //     print_qblock(qweight, nrows_weight * ncols / QK8_0);
+    //     printf("HBM: qx:\n");
+    //     print_qblock(qx, nrows_x * ncols / QK8_0);
+    // }
 
-    Matmul kernel to perform quantized matrix multiplication:
-        out = (qweight * x.T).T
+    auto tile_col_idx_bias = TILE_SIZE_COL * blockIdx.x;
+    auto tile_row_idx_bias = TILE_SIZE_ROW * blockIdx.y;
 
-    If we temporarily ignore quantization, element in out is:
-        out_i_j = sum(qweight_j_k * x_i_k) for k in range(ncols),
-
-    so for (i, j) in out, we need (i, :) in x and (j, :) in qweight, in which
-    ":" means all elements in that dimension.
-
-
-    We perform matmul tilewise, one tile (of out) per block, tile size is defined as TILE_SIZE_COL and TILE_SIZE_ROW,
-    so each block handle TILE_SIZE_COL * TILE_SIZE_ROW output elements.
-
-    Each block contains 32 * 32 = 1024 threads,
-    since we define TILE_SIZE_ROW = 32 and TILE_SIZE_COL = 64,
-    each thread must handle 2 outupt elements.
-
-    So this kernel is expected to be launched with:
-      gridDim = (ncols_out/TILE_SIZE_COL, nrows_out/TILE_SIZE_ROW)
-      blockDim = (32, 32)
-
-    Thread indexing:
-        threadIdx.x -> (column coordinate / 2) of element in tile output
-        threadIdx.y -> row coordinate of element in tile output
-
-
-    For computation in one block:
-    Since we can't assume that all input data that required for output of this
-    tile can be loaded into shared memory, so we load just one segment of the
-    input data, do the partial matmul, and add result to a temprary sum. Do this
-    until we done for all input data requierd, and we got the final output.
-
-    */
-
-    // IDEA: stride in both x and y direction?
-    // IDEA: make striding a argument?
-
-    int tile_col_idx_bias = TILE_SIZE_COL * blockIdx.x;
-    int tile_row_idx_bias = TILE_SIZE_ROW * blockIdx.y;
-
-    int &nrows_out = nrows_x;
-    int &ncols_out = nrows_weight;
+    auto &nrows_out = nrows_x;
+    auto &ncols_out = nrows_weight;
 
     // Allocate shared memory and registers
-
-    int32_t *smem_qweight_qs;
-    half *smem_qweight_d;
-    int32_t *smem_x_qs;
-    half *smem_x_d;
+    int32_t *smem_qweight_qs = nullptr;
+    half *smem_qweight_d = nullptr;
+    int32_t *smem_x_qs = nullptr;
+    half *smem_x_d = nullptr;
 
     allocate_shared_memory(smem_qweight_qs, smem_qweight_d, smem_x_qs, smem_x_d);
 
-    float sum[2] = {0};
+    // if (is_first_block() && is_first_thread())
+    // {
+    //     printf("BEFORE LOOP START\n");
+    //     printf("smem_qweight after alloc:\n");
+    //     print_smem(smem_qweight_qs, smem_qweight_d, TILE_SIZE_COL * BLOCK_SIZE_SEGMENT);
+    //     printf("smem_x after alloc:\n");
+    //     print_smem(smem_x_qs, smem_x_d, TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT);
+    // }
+
+    float sum[TILE_SIZE_ROW / BLOCK_SIZE_ROW][TILE_SIZE_COL / BLOCK_SIZE_COL] = {{0.0f}};
+    // __syncthreads();
 
     // Calculation
     // loop over segments
-    for (int segment_idx = 0; segment_idx < num_segments_per_row; segment_idx++)
+#pragma unroll
+    for (auto segment_start_idx = 0; segment_start_idx < num_qblocks_per_row; segment_start_idx += BLOCK_SIZE_SEGMENT)
     {
-        __syncthreads();
-        int num_valid_qblock = segment_idx != num_segments_per_row - 1
-                                   ? QBLOCKS_PER_SEGMENT
-                                   : QBLOCKS_PER_SEGMENT - num_invalid_qblocks_per_row;
 #pragma unroll
-        for (int col_stride = 0; col_stride < 2; col_stride++)
+        for (auto row_stride = 0; row_stride < TILE_SIZE_ROW / BLOCK_SIZE_ROW; row_stride++)
         {
-            int tile_col_idx = threadIdx.x + 32 * col_stride;
-            int tile_row_idx = threadIdx.y;
-
-            int global_out_col_idx = tile_col_idx + tile_col_idx_bias;
-            int global_out_row_idx = tile_row_idx + tile_row_idx_bias;
-
-            if (global_out_col_idx >= ncols_out || global_out_row_idx >= nrows_out)
-                continue;
-
-            // load input data segment from global memory to shared memory
-            // IDEA: if tile_row_idx == 0 and tile_col_idx == 0, latency is 2x, maybe offload work to tile_idx(1,1) ?
-            if (tile_row_idx == 0 || tile_col_idx == 0)
-            {
 #pragma unroll
-                for (int qblock_idx_in_segment = 0; qblock_idx_in_segment < num_valid_qblock; qblock_idx_in_segment++)
+            for (auto col_stride = 0; col_stride < TILE_SIZE_COL / BLOCK_SIZE_COL; col_stride++)
+            {
+                auto segment_idx = segment_start_idx + threadIdx.x;
+                auto tile_col_idx = BLOCK_SIZE_COL * col_stride + threadIdx.y;
+                auto tile_row_idx = BLOCK_SIZE_ROW * row_stride + threadIdx.z;
+
+                auto global_out_col_idx = tile_col_idx_bias + tile_col_idx;
+                auto global_out_row_idx = tile_row_idx_bias + tile_row_idx;
+
+                if (global_out_col_idx >= ncols_out || global_out_row_idx >= nrows_out || segment_idx >= num_qblocks_per_row)
+                    continue;
+
+                // if (is_first_block() && is_first_thread())
+                // {
+                //     printf("segment_start_idx:%d, row_stride:%d, col_stride:%d\n", segment_start_idx, row_stride, col_stride);
+                //     printf("BEFORE_LOAD\n");
+                //     printf("smem_qweight:\n");
+                //     print_smem(smem_qweight_qs, smem_qweight_d, TILE_SIZE_COL * BLOCK_SIZE_SEGMENT);
+                //     printf("smem_x:\n");
+                //     print_smem(smem_x_qs, smem_x_d, TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT);
+                // }
+
+                // __syncthreads();
+                // load input data segment from global memory to shared memory
+                if (tile_row_idx == 0)
                 {
-                    if (tile_row_idx == 0)
-                    {
-                        load_qblock_to_shared_memory(qweight, smem_qweight_qs, smem_qweight_d, global_out_col_idx, tile_col_idx, num_qblocks_per_row, segment_idx, qblock_idx_in_segment);
-                    }
-                    if (tile_col_idx == 0)
-                    {
-                        load_qblock_to_shared_memory(qx, smem_x_qs, smem_x_d, global_out_row_idx, tile_row_idx, num_qblocks_per_row, segment_idx, qblock_idx_in_segment);
-                    }
+                    load_qblock_to_shared_memory(qweight, smem_qweight_qs, smem_qweight_d, global_out_col_idx, tile_col_idx, num_qblocks_per_row, segment_idx, threadIdx.x, row_stride, col_stride, true);
                 }
-            }
-            __syncthreads();
+                if (tile_col_idx == 0)
+                {
+                    load_qblock_to_shared_memory(qx, smem_x_qs, smem_x_d, global_out_row_idx, tile_row_idx, num_qblocks_per_row, segment_idx, threadIdx.x, row_stride, col_stride, false);
+                }
+                __syncthreads();
 
-            // do vecdot for the qblock of this thread
-#pragma unroll
-            for (int qblock_idx_in_segment = 0; qblock_idx_in_segment < num_valid_qblock; qblock_idx_in_segment++)
-            {
+                // if (is_first_block() && is_first_thread())
+                // {
+                //     printf("segment_start_idx:%d, row_stride:%d, col_stride:%d\n", segment_start_idx, row_stride, col_stride);
+                //     //     printf("AFTER_LOAD\n");
+                //     //     printf("smem_qweight:\n");
+                //     //     print_smem(smem_qweight_qs, smem_qweight_d, TILE_SIZE_COL * BLOCK_SIZE_SEGMENT);
+                //     //     printf("smem_x:\n");
+                //     //     print_smem(smem_x_qs, smem_x_d, TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT);
+                // }
+
+                // do vecdot for the qblock of this thread
                 block_q8_0 qblock_qweight, qblock_x;
-                get_qblock_from_shared_memory(smem_x_qs, smem_x_d, &qblock_x, tile_row_idx, qblock_idx_in_segment);
-                get_qblock_from_shared_memory(smem_qweight_qs, smem_qweight_d, &qblock_qweight, tile_col_idx, qblock_idx_in_segment);
-                sum[col_stride] += vec_dot_q8_0_q8_0(&qblock_qweight, &qblock_x);
+
+                get_qblock_from_shared_memory(smem_x_qs, smem_x_d, &qblock_x, tile_row_idx, threadIdx.x);
+                get_qblock_from_shared_memory(smem_qweight_qs, smem_qweight_d, &qblock_qweight, tile_col_idx, threadIdx.x);
+
+                // print_single_qblock(qblock_qweight);
+                // print_single_qblock(qblock_x);
+
+                sum[row_stride][col_stride] += vec_dot_q8_0_q8_0(&qblock_qweight, &qblock_x);
+                // __syncthreads();
             }
         }
     }
 
-// write output back to global memory
+    // if (is_first_block() && is_first_thread())
+    // {
+    //     // printf("segment_start_idx:%d, row_stride:%d, col_stride:%d\n", segment_start_idx, row_stride, col_stride);
+    //     //     printf("AFTER_LOAD\n");
+    //     printf("smem_qweight:\n");
+    //     print_smem(smem_qweight_qs, smem_qweight_d, TILE_SIZE_COL * BLOCK_SIZE_SEGMENT);
+    //     printf("smem_x:\n");
+    //     print_smem(smem_x_qs, smem_x_d, TILE_SIZE_ROW * BLOCK_SIZE_SEGMENT);
+    // }
+
+    // printf("BEFORE SHFL | b%d,%d,%d,t%d,%d,%d | sum: %f, %f, %f, %f\n",
+    //        blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
+    //        sum[0][0], sum[0][1], sum[1][0], sum[1][1]);
+
+    // shuffle sum to threadIdx.x=0
 #pragma unroll
-    for (int col_stride = 0; col_stride < 2; col_stride++)
+    for (auto delta = 2; delta > 0; delta /= 2)
     {
-        int tile_col_idx = threadIdx.x + 32 * col_stride;
-        int tile_row_idx = threadIdx.y;
-
-        int global_out_col_idx = tile_col_idx + tile_col_idx_bias;
-        int global_out_row_idx = tile_row_idx + tile_row_idx_bias;
-
-        if (global_out_col_idx >= ncols_out || global_out_row_idx >= nrows_out)
-            continue;
-
-        out[global_out_row_idx * ncols_out + global_out_col_idx] = __float2half(sum[col_stride]);
+#pragma unroll
+        for (auto row_stride = 0; row_stride < TILE_SIZE_ROW / BLOCK_SIZE_ROW; row_stride++)
+        {
+#pragma unroll
+            for (auto col_stride = 0; col_stride < TILE_SIZE_COL / BLOCK_SIZE_COL; col_stride++)
+            {
+                sum[row_stride][col_stride] += __shfl_down_sync((uint64_t)-1, sum[row_stride][col_stride], delta);
+            }
+        }
     }
+
+    // printf("AFTER SHFL | b%d,%d,%d,t%d,%d,%d | sum: %f, %f, %f, %f\n",
+    //        blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z,
+    //        sum[0][0], sum[0][1], sum[1][0], sum[1][1]);
+
+    // write output back to global memory
+#pragma unroll
+    for (auto row_stride = 0; row_stride < TILE_SIZE_ROW / BLOCK_SIZE_ROW; row_stride++)
+    {
+#pragma unroll
+        for (auto col_stride = 0; col_stride < TILE_SIZE_COL / BLOCK_SIZE_COL; col_stride++)
+        {
+            auto tile_col_idx = BLOCK_SIZE_COL * col_stride + threadIdx.y;
+            auto tile_row_idx = BLOCK_SIZE_ROW * row_stride + threadIdx.z;
+
+            auto global_out_col_idx = tile_col_idx_bias + tile_col_idx;
+            auto global_out_row_idx = tile_row_idx_bias + tile_row_idx;
+
+            if (global_out_col_idx >= ncols_out || global_out_row_idx >= nrows_out || threadIdx.x != 0)
+                continue;
+
+            out[global_out_row_idx * ncols_out + global_out_col_idx] = sum[row_stride][col_stride];
+        }
+    }
+}
+
+torch::Tensor ggml_mul_mat_a8_q8_0_mi50(torch::Tensor W, // quant weight, q8_0
+                                        torch::Tensor X  // input, fp16
+)
+{
+    int ncols = X.size(1);
+    if (ncols % 32 != 0)
+    {
+        throw std::invalid_argument("x.shape[1] must be multiple of 32!\n");
+    }
+    int nrows_x = X.size(0);
+    int nrows_w = W.size(0);
+
+    int block_q8_0_per_row = (ncols + QK8_0 - 1) / QK8_0;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // quantized X
+    auto options = torch::TensorOptions().dtype(torch::kInt8).device(W.device());
+    at::Tensor quant_X = torch::empty({nrows_x, block_q8_0_per_row * (int)sizeof(block_q8_0)}, options);
+
+    const dim3 gridDim_quant((ncols + WARP_SIZE_GCN - 1) / WARP_SIZE_GCN, nrows_x);
+    const dim3 blockDim_quant(WARP_SIZE_GCN);
+
+    // printf("INPUT_X:\n");
+    // print_float_tensor(X);
+    quantize_q8_0_mi50<<<gridDim_quant, blockDim_quant, 0, stream>>>((half *)X.data_ptr(), (block_q8_0 *)quant_X.data_ptr(), nrows_x, ncols, block_q8_0_per_row);
+
+    // printf("RIGHT AFTER X QUANTIZATION:\n");
+    // print_qblock((block_q8_0 *)quant_X.data_ptr(), nrows_x * ncols / QK8_0);
+
+    // do matmul
+    int &nrows_out = nrows_x;
+    int &ncols_out = nrows_w;
+
+    options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+    at::Tensor Y = torch::zeros({nrows_out, ncols_out}, options);
+
+    int num_qblocks_per_row = (ncols + QK8_0 - 1) / QK8_0;
+
+    int num_tiles_col = (ncols_out + TILE_SIZE_COL - 1) / TILE_SIZE_COL;
+    int num_tiles_row = (nrows_out + TILE_SIZE_ROW - 1) / TILE_SIZE_ROW;
+    const dim3 gridDim_mulmat(num_tiles_col, num_tiles_row);
+
+    const dim3 blockDim_mulmat(BLOCK_SIZE_SEGMENT, BLOCK_SIZE_COL, BLOCK_SIZE_ROW); // for v50
+    // const dim3 blockDim_mulmat(BLOCK_SIZE_ROW, BLOCK_SIZE_COL, BLOCK_SIZE_SEGMENT); // for v46
+
+    mul_mat_q8_0_mi50<<<gridDim_mulmat, blockDim_mulmat, 0, stream>>>(
+        (block_q8_0 *)W.data_ptr(), (block_q8_0 *)quant_X.data_ptr(),
+        (half *)Y.data_ptr(), ncols, nrows_w, nrows_x, num_qblocks_per_row);
+
+    return Y;
 }
