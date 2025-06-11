@@ -5,16 +5,18 @@ import signal
 import sys
 
 import vllm.entrypoints.cli.benchmark.main
+import vllm.entrypoints.cli.collect_env
 import vllm.entrypoints.cli.openai
 import vllm.entrypoints.cli.serve
 import vllm.version
-from vllm.entrypoints.utils import cli_env_setup
+from vllm.entrypoints.utils import VLLM_SERVE_PARSER_EPILOG, cli_env_setup
 from vllm.utils import FlexibleArgumentParser
 
 CMD_MODULES = [
     vllm.entrypoints.cli.openai,
     vllm.entrypoints.cli.serve,
     vllm.entrypoints.cli.benchmark.main,
+    vllm.entrypoints.cli.collect_env,
 ]
 
 
@@ -30,7 +32,10 @@ def register_signal_handlers():
 def main():
     cli_env_setup()
 
-    parser = FlexibleArgumentParser(description="vLLM CLI")
+    parser = FlexibleArgumentParser(
+        description="vLLM CLI",
+        epilog=VLLM_SERVE_PARSER_EPILOG,
+    )
     parser.add_argument('-v',
                         '--version',
                         action='version',
